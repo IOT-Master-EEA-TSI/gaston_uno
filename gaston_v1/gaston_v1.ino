@@ -1,5 +1,8 @@
+
 #include <DHT.h>
 #include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
 
 // --- Broches capteurs environnementaux ---
 #define DHTPIN 5
@@ -17,17 +20,20 @@
 #define ECHO_PIN_CHAT 3
 
 // --- Capteur de gaz Flying Fish (type MQ) ---
-#define GAS_SENSOR A5
+#define GAS_SENSOR A2
 #define GAS_ALERT_THRESHOLD 33  // Seuil en %
 
 DHT dht(DHTPIN, DHTTYPE);
+LiquidCrystal_I2C lcd(0x27, 16, 2); // Adresse 0x27, écran 16 colonnes x 2 lignes
 
-// --- Gestion des délais non-bloquants ---
+
 unsigned long previousMillis = 0;
 unsigned long interval = 2000;
-
 unsigned long previousMillisChat = 0;
 unsigned long intervalChat = 100;
+
+bool pumpOverride = false;
+bool pumpState = false; // true = ON, false = OFF
 
 void setup() {
   Serial.begin(9600);
@@ -39,90 +45,117 @@ void setup() {
   
   pinMode(TRIG_PIN_THYM, OUTPUT);
   pinMode(ECHO_PIN_THYM, INPUT);
-
   pinMode(TRIG_PIN_CHAT, OUTPUT);
   pinMode(ECHO_PIN_CHAT, INPUT);
   
   dht.begin();
-  //Serial.println(F("🌿 Démarrage du système - Capteurs opérationnels"));
+
+  lcd.init(); // Initialiser l'écran
+  lcd.backlight(); // Activer le rétroéclairage
+
 }
 
-// --- Capteur DHT11 ---
+// --- Capteurs ---
 void readDHT(float &temperature, float &humidity) {
   humidity = dht.readHumidity();
   temperature = dht.readTemperature();
-  if (isnan(humidity) || isnan(temperature)) {
-    Serial.println(F("Erreur DHT11"));
-  }
 }
 
-// --- Capteur de lumière ---
 float readLight() {
-  int lightValue = analogRead(LIGHT_SENSOR);
-  return map(lightValue, 0, 1023, 0, 100);
+  int raw = analogRead(LIGHT_SENSOR);
+  return constrain(map(raw, 800, 200, 0, 100), 0, 100);
 }
 
-// --- Capteur humidité sol ---
+
 float readSoil() {
-  int soilValue = analogRead(SOIL_SENSOR);
-  return map(soilValue, 1023, 0, 0, 100);
+  return map(analogRead(SOIL_SENSOR), 1023, 0, 0, 100);
 }
 
-// --- Capteur ultrason (thym) ---
 float readHeightThym() {
-  long durationThym = 0;
-  float height = 0;
   digitalWrite(TRIG_PIN_THYM, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN_THYM, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN_THYM, LOW);
-  durationThym = pulseIn(ECHO_PIN_THYM, HIGH);
-
-  if (durationThym == 0 || durationThym > 40000) {
-    height = -1;
-  } else {
-    height = durationThym * 0.034 / 2;
-  }
-  return height;
-}
-
-// --- Capteur de gaz (Flying Fish MQ) ---
-float readGas() {
-  int analogValue = analogRead(GAS_SENSOR);
-  return map(analogValue, 0, 1023, 0, 100);
-}
-
-// --- Capteur ultrason (chat) ---
-float readDistanceChat() {
-  long durationChat = 0;
-  float distanceChat = 0;
   
+  long duration = pulseIn(ECHO_PIN_THYM, HIGH);
+  float distance = duration * 0.034 / 2;  // distance en cm
+  
+  return 58 - distance;  // hauteur du thym en cm
+}
+
+float readGas() {
+  return map(analogRead(GAS_SENSOR), 0, 1023, 0, 100);
+}
+
+float readDistanceChat() {
   digitalWrite(TRIG_PIN_CHAT, LOW);
   delayMicroseconds(2);
   digitalWrite(TRIG_PIN_CHAT, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN_CHAT, LOW);
-  
-  durationChat = pulseIn(ECHO_PIN_CHAT, HIGH, 30000);
-  
-  if (durationChat == 0) {
-    return -1;
+  long duration = pulseIn(ECHO_PIN_CHAT, HIGH, 30000);
+  return (duration == 0) ? -1 : duration * 0.034 / 2;
+}
+
+void checkChatProximityAndBuzz() {
+  float distance = readDistanceChat();
+  if (distance > 1 && distance < 50) {
+    digitalWrite(BUZZER_PIN, HIGH);
   } else {
-    distanceChat = durationChat * 0.034 / 2;
-    return distanceChat;
+    digitalWrite(BUZZER_PIN, LOW);
   }
 }
+
+void controlPump(float soilPercent) {
+  if (!pumpOverride) {
+    float soilDryThreshold = 4.0;
+    pumpState = (soilPercent < soilDryThreshold);
+    digitalWrite(PUMP_PIN, pumpState ? LOW : HIGH);
+  }
+}
+
+void processSerialCommand() {
+  if (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    if (command == "pump_on") {
+      pumpOverride = true;
+      pumpState = true;
+      digitalWrite(PUMP_PIN, LOW);
+    } else if (command == "pump_off") {
+      pumpOverride = true;
+      pumpState = false;
+      digitalWrite(PUMP_PIN, HIGH);
+    } else if (command == "auto") {
+      pumpOverride = false;
+    }
+  }
+}
+
+void checkAnomaliesAndLED(float temperature, float soilPercent, float gasPercent, float distanceChat) {
+  bool tempAnomaly = (temperature > 35.0 || temperature < 0.0);
+  bool soilAnomaly = (soilPercent < 4.0);
+  bool gasAnomaly = (gasPercent >= GAS_ALERT_THRESHOLD);
+  bool catDetected = (distanceChat > 1 && distanceChat < 50);
+
+  if (tempAnomaly || soilAnomaly || gasAnomaly || catDetected) {
+    digitalWrite(LED_PIN, HIGH); // Alerte : allumer la LED
+  } else {
+    digitalWrite(LED_PIN, LOW);  // Tout est normal
+  }
+}
+
 
 void loop() {
   unsigned long currentMillis = millis();
   float temperature, humidity, lightPercent, soilPercent, heightThym, gasPercent, distanceChat;
 
-  // Lecture des capteurs toutes les 2 secondes
+  processSerialCommand();
+
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis;
 
-    // Lire les capteurs
     readDHT(temperature, humidity);
     lightPercent = readLight();
     soilPercent = readSoil();
@@ -130,28 +163,36 @@ void loop() {
     gasPercent = readGas();
     distanceChat = readDistanceChat();
 
-    // Créer le JSON avec les données à envoyer
-    String json = "{\"temperature\": " + String(temperature) + 
-                  ", \"humidity_air\": " + String(humidity) + 
-                  ", \"light\": " + String(lightPercent) + 
-                  ", \"soil_moisture\": " + String(soilPercent) + 
-                  ", \"height_thym\": " + String(heightThym) + 
-                  ", \"gas\": " + String(gasPercent) + 
-                  ", \"cat_detected\": " + String(distanceChat) + "}";
+    controlPump(soilPercent);
 
-    // Envoyer le JSON via le port série
+    checkAnomaliesAndLED(temperature, soilPercent, gasPercent, distanceChat);
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("T:");
+    lcd.print(temperature, 1);
+    lcd.print(" H:");
+    lcd.print(humidity, 0);
+
+    lcd.setCursor(0, 1);
+    lcd.print("Sol:");
+    lcd.print(soilPercent, 0);
+    lcd.print("% G:");
+    lcd.print(gasPercent, 0);
+
+    String json = "{\"temp\":" + String(temperature) +
+                  ",\"hum\":" + String(humidity) +
+                  ",\"soil\":" + String(soilPercent) +
+                  ",\"light\":" + String(lightPercent) +
+                  ",\"gas\":" + String(gasPercent) +
+                  ",\"height\":" + String(heightThym) +
+                  ",\"cat\":" + ((distanceChat > 1 && distanceChat < 50) ? "1" : "0") + "}";
+
     Serial.println(json);
   }
 
-  // Vérification du mouvement du chat toutes les 100ms
   if (currentMillis - previousMillisChat >= intervalChat) {
     previousMillisChat = currentMillis;
-    distanceChat = readDistanceChat();
-
-    if (distanceChat > 1 && distanceChat < 50) {
-      Serial.print("[ALERTE MOUVEMENT] Mouvement détecté à ");
-      Serial.print(distanceChat);
-      Serial.println(" cm");
-    }
+    checkChatProximityAndBuzz();
   }
 }
